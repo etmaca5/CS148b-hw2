@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import statistics
+import timeit
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
+
+from basics.model import BasicsTransformerLM
+from basics.optimizer import AdamW
 
 
 @dataclass(frozen=True)
@@ -55,14 +61,48 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
+def _device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _sync() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 def build_model(config: BenchmarkConfig) -> torch.nn.Module:
     """Instantiate the staff Basics transformer for the requested model size."""
-    raise NotImplementedError
+    spec = MODEL_SPECS[config.model_size]
+    model = BasicsTransformerLM(
+        vocab_size=config.vocab_size,
+        context_length=config.context_length,
+        d_model=spec.d_model,
+        num_layers=spec.num_layers,
+        num_heads=spec.num_heads,
+        d_ff=spec.d_ff,
+        rope_theta=10000.0,
+    )
+    model = model.to(_device())
+    if config.compile_model:
+        model = torch.compile(model)
+    return model
 
 
 def make_random_batch(config: BenchmarkConfig, device: torch.device) -> torch.Tensor:
     """Construct a random token batch for benchmarking and profiling."""
-    raise NotImplementedError
+    return torch.randint(
+        0, config.vocab_size, (config.batch_size, config.context_length), device=device
+    )
+
+
+def _compute_loss(logits: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+    # Standard next-token prediction loss on the random batch.
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_targets = batch[:, 1:].contiguous()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_targets.view(-1),
+    )
 
 
 def run_single_step(
@@ -70,14 +110,76 @@ def run_single_step(
     batch: torch.Tensor,
     mode: Literal["forward", "forward-backward", "train-step"],
     autocast_context,
+    optimizer: torch.optim.Optimizer | None = None,
 ) -> None:
     """Execute one benchmark step and synchronize CUDA before returning."""
-    raise NotImplementedError
+    if mode == "forward":
+        with torch.no_grad(), autocast_context:
+            model(batch)
+    elif mode == "forward-backward":
+        with autocast_context:
+            logits = model(batch)
+            loss = _compute_loss(logits, batch)
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+    elif mode == "train-step":
+        assert optimizer is not None
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context:
+            logits = model(batch)
+            loss = _compute_loss(logits, batch)
+        loss.backward()
+        optimizer.step()
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+    _sync()
 
 
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
-    raise NotImplementedError
+    device = _device()
+    model = build_model(config)
+    batch = make_random_batch(config, device)
+    autocast_ctx = make_autocast_context(config.use_bf16)
+
+    optimizer = None
+    if config.mode == "train-step":
+        optimizer = AdamW(model.parameters(), lr=1e-4)
+
+    # Warm-up: kick off kernels, let caching allocator stabilize, compile if needed.
+    for _ in range(config.warmup_steps):
+        run_single_step(model, batch, config.mode, autocast_ctx, optimizer)
+
+    maybe_start_memory_history(config.use_memory_profiler)
+
+    timings: list[float] = []
+    for _ in range(config.measure_steps):
+        start = timeit.default_timer()
+        run_single_step(model, batch, config.mode, autocast_ctx, optimizer)
+        timings.append(timeit.default_timer() - start)
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+    maybe_dump_memory_snapshot(
+        config.use_memory_profiler, config.output_dir / "memory_snapshot.pickle"
+    )
+
+    mean = statistics.fmean(timings)
+    stdev = statistics.stdev(timings) if len(timings) > 1 else 0.0
+    results = {
+        "mean_s": mean,
+        "stdev_s": stdev,
+        "min_s": min(timings),
+        "max_s": max(timings),
+        "n": float(len(timings)),
+    }
+    print(
+        f"[{config.model_size}/{config.mode}] "
+        f"ctx={config.context_length} bs={config.batch_size} bf16={config.use_bf16} "
+        f"mean={mean * 1000:.2f} ms  std={stdev * 1000:.2f} ms  "
+        f"min={min(timings) * 1000:.2f} ms  max={max(timings) * 1000:.2f} ms  "
+        f"(n={len(timings)})"
+    )
+    return results
 
 
 def annotated_scaled_dot_product_attention(*args, **kwargs):
