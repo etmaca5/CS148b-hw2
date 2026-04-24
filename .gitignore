@@ -1,0 +1,7 @@
+*.md
+*.mdc
+
+# hw2 (Python) — do not track env or build metadata
+hw2/.venv/
+**/__pycache__/
+*.egg-info/
