@@ -248,13 +248,14 @@ def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
 
 
 def maybe_start_memory_history(enabled: bool) -> None:
-    if enabled:
-        raise NotImplementedError
+    if enabled and torch.cuda.is_available():
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
 
 
 def maybe_dump_memory_snapshot(enabled: bool, output_path: Path) -> None:
-    if enabled:
-        raise NotImplementedError
+    if enabled and torch.cuda.is_available():
+        torch.cuda.memory._dump_snapshot(str(output_path))
+        torch.cuda.memory._record_memory_history(enabled=None)
 
 
 def make_autocast_context(use_bf16: bool):
