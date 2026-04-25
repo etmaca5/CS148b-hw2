@@ -1,18 +1,39 @@
 from __future__ import annotations
 
 import argparse
+import json
 import statistics
+import sys
 import timeit
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-import torch
-import torch.nn.functional as F
+# The real `basics` package lives at <repo>/basics/basics/. Make sure the parent
+# dir is on sys.path so `import basics.model` resolves to the regular package,
+# not the outer namespace dir. Also evict a stale namespace import if one snuck
+# in from an earlier `import basics`.
+_BASICS_PARENT = Path(__file__).resolve().parent.parent / "basics"
+if str(_BASICS_PARENT) not in sys.path:
+    sys.path.insert(0, str(_BASICS_PARENT))
+_cached = sys.modules.get("basics")
+if _cached is not None and getattr(_cached, "__file__", None) is None:
+    for _name in [n for n in list(sys.modules) if n == "basics" or n.startswith("basics.")]:
+        del sys.modules[_name]
 
-from basics.model import BasicsTransformerLM
-from basics.optimizer import AdamW
+import math  # noqa: E402
+
+import torch  # noqa: E402
+import torch.cuda.nvtx as nvtx  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+from einops import einsum  # noqa: E402
+
+import basics.model  # noqa: E402
+from basics.model import BasicsTransformerLM  # noqa: E402
+from basics.nn_utils import softmax  # noqa: E402
+from basics.optimizer import AdamW  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -41,6 +62,7 @@ class BenchmarkConfig:
     mode: Literal["forward", "forward-backward", "train-step"] = "forward"
     use_bf16: bool = False
     use_memory_profiler: bool = False
+    use_annotated_attention: bool = False
     compile_model: bool = False
     output_dir: Path = Path("artifacts")
 
@@ -56,6 +78,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["forward", "forward-backward", "train-step"], default="forward")
     parser.add_argument("--use-bf16", action="store_true")
     parser.add_argument("--use-memory-profiler", action="store_true")
+    parser.add_argument("--use-annotated-attention", action="store_true")
     parser.add_argument("--compile-model", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=Path("artifacts"))
     return parser
@@ -114,22 +137,25 @@ def run_single_step(
 ) -> None:
     """Execute one benchmark step and synchronize CUDA before returning."""
     if mode == "forward":
-        with torch.no_grad(), autocast_context:
+        with torch.no_grad(), autocast_context, nvtx.range("forward"):
             model(batch)
     elif mode == "forward-backward":
-        with autocast_context:
+        with autocast_context, nvtx.range("forward"):
             logits = model(batch)
             loss = _compute_loss(logits, batch)
-        loss.backward()
+        with nvtx.range("backward"):
+            loss.backward()
         model.zero_grad(set_to_none=True)
     elif mode == "train-step":
         assert optimizer is not None
         optimizer.zero_grad(set_to_none=True)
-        with autocast_context:
+        with autocast_context, nvtx.range("forward"):
             logits = model(batch)
             loss = _compute_loss(logits, batch)
-        loss.backward()
-        optimizer.step()
+        with nvtx.range("backward"):
+            loss.backward()
+        with nvtx.range("optimizer-step"):
+            optimizer.step()
     else:
         raise ValueError(f"Unknown mode: {mode}")
     _sync()
@@ -137,6 +163,10 @@ def run_single_step(
 
 def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
     """Run warmup steps followed by timed measurement steps."""
+    if config.use_annotated_attention:
+        # Swap basics' attention for the NVTX-annotated version. Math is unchanged.
+        basics.model.scaled_dot_product_attention = annotated_scaled_dot_product_attention
+
     device = _device()
     model = build_model(config)
     batch = make_random_batch(config, device)
@@ -147,16 +177,18 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
         optimizer = AdamW(model.parameters(), lr=1e-4)
 
     # Warm-up: kick off kernels, let caching allocator stabilize, compile if needed.
-    for _ in range(config.warmup_steps):
-        run_single_step(model, batch, config.mode, autocast_ctx, optimizer)
+    with nvtx.range("warmup"):
+        for _ in range(config.warmup_steps):
+            run_single_step(model, batch, config.mode, autocast_ctx, optimizer)
 
     maybe_start_memory_history(config.use_memory_profiler)
 
     timings: list[float] = []
-    for _ in range(config.measure_steps):
-        start = timeit.default_timer()
-        run_single_step(model, batch, config.mode, autocast_ctx, optimizer)
-        timings.append(timeit.default_timer() - start)
+    with nvtx.range("measure"):
+        for _ in range(config.measure_steps):
+            start = timeit.default_timer()
+            run_single_step(model, batch, config.mode, autocast_ctx, optimizer)
+            timings.append(timeit.default_timer() - start)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     maybe_dump_memory_snapshot(
@@ -179,12 +211,40 @@ def benchmark_model(config: BenchmarkConfig) -> dict[str, float]:
         f"min={min(timings) * 1000:.2f} ms  max={max(timings) * 1000:.2f} ms  "
         f"(n={len(timings)})"
     )
+
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "model_size": config.model_size,
+        "mode": config.mode,
+        "context_length": config.context_length,
+        "batch_size": config.batch_size,
+        "vocab_size": config.vocab_size,
+        "warmup_steps": config.warmup_steps,
+        "measure_steps": config.measure_steps,
+        "use_bf16": config.use_bf16,
+        "compile_model": config.compile_model,
+        "device": str(_device()),
+        **results,
+        "timings_s": timings,
+    }
+    log_path = config.output_dir / "benchmarks.jsonl"
+    with log_path.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+    print(f"saved -> {log_path}")
     return results
 
 
-def annotated_scaled_dot_product_attention(*args, **kwargs):
-    """Optional NVTX-annotated attention path for Nsight Systems profiling."""
-    raise NotImplementedError
+def annotated_scaled_dot_product_attention(Q, K, V, mask=None):
+    """Drop-in replacement for basics.model.scaled_dot_product_attention with NVTX ranges."""
+    d_k = K.shape[-1]
+    with nvtx.range("computing attention scores"):
+        scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+        if mask is not None:
+            scores = torch.where(mask, scores, float("-inf"))
+    with nvtx.range("computing softmax"):
+        weights = softmax(scores, dim=-1)
+    with nvtx.range("final matmul"):
+        return einsum(weights, V, "... query key, ... key d_v -> ... query d_v")
 
 
 def maybe_start_memory_history(enabled: bool) -> None:
@@ -215,6 +275,7 @@ def main() -> None:
         mode=args.mode,
         use_bf16=args.use_bf16,
         use_memory_profiler=args.use_memory_profiler,
+        use_annotated_attention=args.use_annotated_attention,
         compile_model=args.compile_model,
         output_dir=args.output_dir,
     )
