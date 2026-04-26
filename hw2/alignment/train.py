@@ -4,16 +4,10 @@ Usage:
 
     python -m alignment.train --output-dir ./grpo_run --n-grpo-steps 50
 
-vLLM is used for fast rollouts; HuggingFace for training. Weights are synced
-from the HF policy into vLLM's in-memory model after every optimizer step.
+Uses HuggingFace `model.generate` for rollouts (no vLLM) so we can run on the
+latest transformers without weight-syncing tricks.
 """
 from __future__ import annotations
-
-# Force vLLM V0 so we can load policy weights into the running engine. The V1
-# engine reorganizes its internals and the in-memory weight-load path no longer
-# works the same way.
-import os
-os.environ.setdefault("VLLM_USE_V1", "0")
 
 import argparse
 import json
@@ -59,67 +53,82 @@ def _load_gsm8k(split: str, max_examples: int | None = None) -> list[dict[str, A
     return examples
 
 
-def _init_vllm(model_name: str, gpu_memory_utilization: float, seed: int):
-    """Init vLLM in the same process as the policy."""
-    from vllm import LLM
+def _generate(
+    policy,
+    tokenizer,
+    prompts: list[str],
+    *,
+    n_per_prompt: int,
+    max_new_tokens: int,
+    min_new_tokens: int,
+    temperature: float,
+    device: str,
+) -> list[str]:
+    """Sample ``n_per_prompt`` completions per prompt with HF generate.
 
-    return LLM(
-        model=model_name,
-        dtype="bfloat16",
-        seed=seed,
-        gpu_memory_utilization=gpu_memory_utilization,
-        enable_prefix_caching=True,
-    )
+    Returns a flat list of decoded responses in the order
+    ``[prompt0_sample0, prompt0_sample1, ..., prompt0_sampleN, prompt1_sample0, ...]``,
+    matching how vLLM with ``n=N`` lays out its outputs.
+    """
+    policy.eval()
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        padding_side="left",
+        add_special_tokens=False,
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = policy.generate(
+            **enc,
+            do_sample=True,
+            temperature=temperature,
+            top_p=1.0,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            num_return_sequences=n_per_prompt,
+            pad_token_id=tokenizer.pad_token_id,
+            stop_strings=["</answer>"],
+            tokenizer=tokenizer,
+        )
+    policy.train()
+
+    prompt_len = enc["input_ids"].shape[1]
+    response_ids = outputs[:, prompt_len:]
+    return tokenizer.batch_decode(response_ids, skip_special_tokens=True)
 
 
-def _load_policy_into_vllm(policy, llm) -> None:
-    """Sync HF policy weights into vLLM's in-memory model (V0 engine path)."""
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
-
-
-def _rollout(llm, prompts, group_size, max_tokens, min_tokens, temperature):
-    from vllm import SamplingParams
-
-    params = SamplingParams(
-        temperature=temperature,
-        top_p=1.0,
-        max_tokens=max_tokens,
-        min_tokens=min_tokens,
-        stop=["</answer>"],
-        include_stop_str_in_output=True,
-        n=group_size,
-    )
-    outputs = llm.generate(list(prompts), params, use_tqdm=False)
-    flat: list[str] = []
-    for out in outputs:
-        for completion in out.outputs:
-            flat.append(completion.text)
-    return flat
-
-
-def _evaluate(llm, examples, max_tokens, temperature) -> dict[str, float]:
-    from vllm import SamplingParams
-
-    prompts = [COT_PROMPT_TEMPLATE.format(question=ex["question"]) for ex in examples]
-    gts = [ex["ground_truth"] for ex in examples]
-    params = SamplingParams(
-        temperature=temperature,
-        top_p=1.0,
-        max_tokens=max_tokens,
-        stop=["</answer>"],
-        include_stop_str_in_output=True,
-        n=1,
-    )
-    outputs = llm.generate(prompts, params, use_tqdm=False)
+def _evaluate(
+    policy,
+    tokenizer,
+    examples: list[dict[str, Any]],
+    max_new_tokens: int,
+    temperature: float,
+    device: str,
+    eval_batch_size: int,
+) -> dict[str, float]:
     n_format = 0
     n_answer = 0
-    for out, gt in zip(outputs, gts, strict=True):
-        info = r1_zero_reward_fn(out.outputs[0].text, gt)
-        n_format += int(info["format_reward"] == 1.0)
-        n_answer += int(info["answer_reward"] == 1.0)
-    n = len(prompts)
+    n = len(examples)
+    for i in range(0, n, eval_batch_size):
+        batch = examples[i : i + eval_batch_size]
+        prompts = [COT_PROMPT_TEMPLATE.format(question=ex["question"]) for ex in batch]
+        gts = [ex["ground_truth"] for ex in batch]
+        responses = _generate(
+            policy,
+            tokenizer,
+            prompts,
+            n_per_prompt=1,
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=1,
+            temperature=temperature,
+            device=device,
+        )
+        for response, gt in zip(responses, gts, strict=True):
+            info = r1_zero_reward_fn(response, gt)
+            n_format += int(info["format_reward"] == 1.0)
+            n_answer += int(info["answer_reward"] == 1.0)
     return {
         "n": n,
         "format_accuracy": n_format / n if n else 0.0,
@@ -127,7 +136,7 @@ def _evaluate(llm, examples, max_tokens, temperature) -> dict[str, float]:
     }
 
 
-def _compute_old_log_probs(policy, input_ids, labels, micro_size, device):
+def _compute_old_log_probs(policy, input_ids, labels, micro_size: int, device: str):
     """Score every (input_ids, labels) pair under the current policy in chunks."""
     chunks: list[torch.Tensor] = []
     policy.eval()
@@ -160,10 +169,10 @@ def train_grpo(
     grad_clip: float = 1.0,
     eval_every: int = 5,
     eval_size: int = 256,
+    eval_batch_size: int = 32,
     seed: int = 0,
     save_final: bool = True,
-    vllm_gpu_memory_utilization: float = 0.3,
-    attn_impl: str = "flash_attention_2",
+    attn_impl: str = "sdpa",
 ) -> dict[str, Any]:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -187,7 +196,7 @@ def train_grpo(
         tokenizer.pad_token = tokenizer.eos_token
     policy = AutoModelForCausalLM.from_pretrained(
         model_name,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         attn_implementation=attn_impl,
     ).to(device)
     policy.train()
@@ -198,9 +207,6 @@ def train_grpo(
         weight_decay=0.0,
         betas=(0.9, 0.95),
     )
-
-    print(f"initializing vLLM (gpu_mem_util={vllm_gpu_memory_utilization})...")
-    llm = _init_vllm(model_name, vllm_gpu_memory_utilization, seed)
 
     train_examples = _load_gsm8k("train")
     val_examples = _load_gsm8k("test")[:eval_size]
@@ -226,14 +232,15 @@ def train_grpo(
         repeated_gts = [gt for gt in gts for _ in range(group_size)]
         repeated_prompts = [p for p in prompts for _ in range(group_size)]
 
-        _load_policy_into_vllm(policy, llm)
-        responses = _rollout(
-            llm,
+        responses = _generate(
+            policy,
+            tokenizer,
             prompts,
-            group_size=group_size,
-            max_tokens=sampling_max_tokens,
-            min_tokens=sampling_min_tokens,
+            n_per_prompt=group_size,
+            max_new_tokens=sampling_max_tokens,
+            min_new_tokens=sampling_min_tokens,
             temperature=sampling_temperature,
+            device=device,
         )
 
         advantages, raw_rewards, reward_meta = compute_group_normalized_rewards(
@@ -310,17 +317,16 @@ def train_grpo(
         with metrics_path.open("a") as f:
             f.write(json.dumps(step_metrics) + "\n")
 
+        gn_str = f"{last_grad_norm:.2f}" if last_grad_norm is not None else "-"
         print(
             f"[step {step:3d}] loss={step_metrics['loss_mean']:.4f} "
             f"r={reward_meta['reward_mean']:.3f} "
             f"fmt={reward_meta['format_reward_mean']:.3f} "
             f"ans={reward_meta['answer_reward_mean']:.3f} "
             f"clip={step_metrics['clip_fraction']:.3f} "
-            f"gn={last_grad_norm if last_grad_norm is None else f'{last_grad_norm:.2f}'} "
-            f"({step_time:.1f}s)"
+            f"gn={gn_str} ({step_time:.1f}s)"
         )
 
-        # Save the first 4 rollouts of every step for the writeup.
         with rollouts_path.open("a") as f:
             f.write(
                 json.dumps(
@@ -341,9 +347,14 @@ def train_grpo(
             )
 
         if (step + 1) % eval_every == 0 or step == n_grpo_steps - 1:
-            _load_policy_into_vllm(policy, llm)
             val_metrics = _evaluate(
-                llm, val_examples, max_tokens=sampling_max_tokens, temperature=sampling_temperature
+                policy,
+                tokenizer,
+                val_examples,
+                max_new_tokens=sampling_max_tokens,
+                temperature=sampling_temperature,
+                device=device,
+                eval_batch_size=eval_batch_size,
             )
             val_metrics["step"] = step
             val_log.append(val_metrics)
@@ -387,10 +398,10 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--eval-every", type=int, default=5)
     p.add_argument("--eval-size", type=int, default=256)
+    p.add_argument("--eval-batch-size", type=int, default=32)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--no-save-final", action="store_true")
-    p.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.3)
-    p.add_argument("--attn-impl", default="flash_attention_2")
+    p.add_argument("--attn-impl", default="sdpa")
     return p
 
 
@@ -415,9 +426,9 @@ def main() -> None:
         grad_clip=args.grad_clip,
         eval_every=args.eval_every,
         eval_size=args.eval_size,
+        eval_batch_size=args.eval_batch_size,
         seed=args.seed,
         save_final=not args.no_save_final,
-        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         attn_impl=args.attn_impl,
     )
 
