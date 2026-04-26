@@ -21,7 +21,6 @@ import random
 import time
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -61,25 +60,16 @@ def _load_gsm8k(split: str, max_examples: int | None = None) -> list[dict[str, A
 
 
 def _init_vllm(model_name: str, gpu_memory_utilization: float, seed: int):
-    """Init vLLM in the same process as the policy.
-
-    We patch `_assert_memory_footprint_increased_during_profiling` because we
-    cohabit with the HF model on the same GPU and that assertion can fire.
-    """
+    """Init vLLM in the same process as the policy."""
     from vllm import LLM
 
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None,
+    return LLM(
+        model=model_name,
+        dtype="bfloat16",
+        seed=seed,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enable_prefix_caching=True,
     )
-    with profiling_patch:
-        return LLM(
-            model=model_name,
-            dtype="bfloat16",
-            seed=seed,
-            gpu_memory_utilization=gpu_memory_utilization,
-            enable_prefix_caching=True,
-        )
 
 
 def _load_policy_into_vllm(policy, llm) -> None:
@@ -197,7 +187,7 @@ def train_grpo(
         tokenizer.pad_token = tokenizer.eos_token
     policy = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation=attn_impl,
     ).to(device)
     policy.train()
