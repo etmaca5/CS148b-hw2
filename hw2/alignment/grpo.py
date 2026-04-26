@@ -83,7 +83,35 @@ def compute_group_normalized_rewards(
     normalize_by_std: bool,
 ) -> tuple[Tensor, Tensor, dict[str, float]]:
     """Compute raw rewards and per-group normalized advantages for GRPO."""
-    raise NotImplementedError
+    raw_list: list[float] = []
+    fmt_list: list[float] = []
+    ans_list: list[float] = []
+    for response, gt in zip(rollout_responses, repeated_ground_truths, strict=True):
+        info = reward_fn(response, gt)
+        raw_list.append(float(info["reward"]))
+        fmt_list.append(float(info.get("format_reward", 0.0)))
+        ans_list.append(float(info.get("answer_reward", 0.0)))
+
+    raw_rewards = torch.tensor(raw_list, dtype=torch.float32)
+    grouped = raw_rewards.view(-1, group_size)
+    centered = grouped - grouped.mean(dim=1, keepdim=True)
+    if normalize_by_std:
+        stds = grouped.std(dim=1, keepdim=True, unbiased=False)
+        normalized = centered / (stds + advantage_eps)
+    else:
+        normalized = centered
+    advantages = normalized.reshape(-1)
+
+    metadata: dict[str, float] = {
+        "reward_mean": float(raw_rewards.mean().item()),
+        "reward_std": float(raw_rewards.std(unbiased=False).item()),
+        "reward_max": float(raw_rewards.max().item()),
+        "reward_min": float(raw_rewards.min().item()),
+        "format_reward_mean": float(sum(fmt_list) / len(fmt_list)) if fmt_list else 0.0,
+        "answer_reward_mean": float(sum(ans_list) / len(ans_list)) if ans_list else 0.0,
+        "group_std_mean": float(grouped.std(dim=1, unbiased=False).mean().item()),
+    }
+    return advantages, raw_rewards, metadata
 
 
 def compute_grpo_clip_loss(
@@ -93,7 +121,20 @@ def compute_grpo_clip_loss(
     cliprange: float,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Compute the per-token GRPO-Clip loss."""
-    raise NotImplementedError
+    adv = advantages.expand_as(policy_log_probs)
+    ratio = torch.exp(policy_log_probs - old_log_probs)
+    clipped = torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+    unclipped_obj = ratio * adv
+    clipped_obj = clipped * adv
+    per_token_loss = -torch.minimum(unclipped_obj, clipped_obj)
+
+    out_of_range = (ratio < 1.0 - cliprange) | (ratio > 1.0 + cliprange)
+    metadata = {
+        "clip_mask": out_of_range,
+        "clip_fraction": out_of_range.float().mean().detach(),
+        "ratio_mean": ratio.mean().detach(),
+    }
+    return per_token_loss, metadata
 
 
 def grpo_microbatch_train_step(
@@ -105,7 +146,23 @@ def grpo_microbatch_train_step(
     cliprange: float,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     """Backpropagate a single GRPO microbatch loss."""
-    raise NotImplementedError
+    per_token_loss, loss_metadata = compute_grpo_clip_loss(
+        advantages=advantages,
+        policy_log_probs=policy_log_probs,
+        old_log_probs=old_log_probs,
+        cliprange=cliprange,
+    )
+    mask = response_mask.to(per_token_loss.dtype)
+    masked = per_token_loss * mask
+    # Masked mean over the sequence dim, then mean over batch.
+    per_example = masked.sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+    batch_loss = per_example.mean()
+    loss = batch_loss / gradient_accumulation_steps
+    loss.backward()
+
+    metadata = dict(loss_metadata)
+    metadata["loss"] = loss.detach()
+    return loss.detach(), metadata
 
 
 def log_generations(
@@ -164,6 +221,3 @@ def log_generations(
     return {"records": records, "summary": summary}
 
 
-def train_grpo(*args, **kwargs) -> dict[str, Any]:
-    """Run the full GRPO training loop from Section 3.5."""
-    raise NotImplementedError
