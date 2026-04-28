@@ -1,0 +1,9 @@
+model_size,context_length,mode,use_bf16,peak_mb,status
+large,128,forward,False,1656.3515625,ok
+large,128,train-step,False,6701.05126953125,ok
+large,256,forward,False,1716.640625,ok
+large,256,train-step,False,8690.8173828125,ok
+large,512,forward,False,1928.96484375,ok
+large,512,train-step,False,14057.2587890625,ok
+large,128,forward,True,2433.2421875,ok
+large,128,train-step,True,6763.8466796875,ok

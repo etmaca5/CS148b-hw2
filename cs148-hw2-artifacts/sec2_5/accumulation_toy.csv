@@ -1,0 +1,5 @@
+case,value,dtype
+"fp32 acc, fp32 add",10.000133514404297,torch.float32
+"fp16 acc, fp16 add",9.953125,torch.float16
+"fp32 acc, fp16 add (auto-promoted)",10.00213623046875,torch.float32
+"fp32 acc, fp16 add cast to fp32",10.00213623046875,torch.float32

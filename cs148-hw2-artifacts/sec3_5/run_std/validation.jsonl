@@ -1,0 +1,10 @@
+{"n": 256, "format_accuracy": 0.27734375, "answer_accuracy": 0.06640625, "step": 4}
+{"n": 256, "format_accuracy": 0.34375, "answer_accuracy": 0.1171875, "step": 9}
+{"n": 256, "format_accuracy": 0.4765625, "answer_accuracy": 0.1953125, "step": 14}
+{"n": 256, "format_accuracy": 0.578125, "answer_accuracy": 0.30078125, "step": 19}
+{"n": 256, "format_accuracy": 0.6875, "answer_accuracy": 0.3203125, "step": 24}
+{"n": 256, "format_accuracy": 0.6328125, "answer_accuracy": 0.3515625, "step": 29}
+{"n": 256, "format_accuracy": 0.73046875, "answer_accuracy": 0.44140625, "step": 34}
+{"n": 256, "format_accuracy": 0.8125, "answer_accuracy": 0.47265625, "step": 39}
+{"n": 256, "format_accuracy": 0.8359375, "answer_accuracy": 0.546875, "step": 44}
+{"n": 256, "format_accuracy": 0.8359375, "answer_accuracy": 0.5546875, "step": 49}
